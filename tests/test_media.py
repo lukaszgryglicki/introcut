@@ -445,6 +445,130 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(before, {path: (app.snapshot(path), digest(path)) for path in inputs})
         self.assert_originals_unchanged()
 
+    def test_long_intro_uses_default_window_and_reuses_its_checkpoints(self):
+        inputs = []
+        for index, color in enumerate(("red", "blue")):
+            path = self.root / f"long-intro-{index}.mp4"
+            command([
+                "ffmpeg", "-v", "error", "-nostdin", "-n",
+                "-threads", "1", "-filter_complex_threads", "1",
+                "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24:duration=9",
+                "-f", "lavfi", "-i", f"color=c={color}:s=160x90:r=24:d=3",
+                "-f", "lavfi", "-i", f"sine=frequency={440 + 440 * index}:duration=12",
+                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                "-map", "[v]", "-map", "2:a", "-c:v", "libx265", "-preset", "ultrafast",
+                "-x265-params", "pools=none:frame-threads=1:keyint=48:scenecut=0:log-level=error",
+                "-c:a", "aac", "-t", "12", str(path),
+            ])
+            inputs.append(path)
+        plan_file = self.root / "long-intro-plan.json"
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(app, "analyze", wraps=app.analyze) as analyze, redirect_stdout(
+            output
+        ), redirect_stderr(errors):
+            code = app.main([
+                "--dry-run", "--save-plan", str(plan_file), "--json",
+                *(str(path) for path in inputs),
+            ])
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        report = json.loads(output.getvalue())
+        self.assertAlmostEqual(report["intro"]["seconds"], 9, delta=0.125)
+        self.assertEqual([call.args[1] for call in analyze.call_args_list], [30, 30])
+        cache_file = Path(str(plan_file) + ".analysis.sqlite3")
+        with app.AnalysisCache(cache_file) as cache:
+            self.assertEqual(cache.connection.execute("SELECT count(*) FROM fingerprints").fetchone()[0], 2)
+        copied_plan = self.root / "long-intro-retry.json"
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(app, "analyze", side_effect=AssertionError("analysis repeated")), redirect_stdout(
+            output
+        ), redirect_stderr(errors):
+            code = app.main([
+                "--dry-run", "--save-plan", str(copied_plan), "--analysis-cache", str(cache_file),
+                "--json", *(str(path) for path in inputs),
+            ])
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assertEqual(json.loads(output.getvalue()), report)
+        self.assert_originals_unchanged()
+
+    def test_full_video_mode_finds_intro_beyond_thirty_seconds_and_caches_to_eof(self):
+        inputs = []
+        durations = (38, 39)
+        for index, (color, duration) in enumerate(zip(("red", "blue"), durations)):
+            path = self.root / f"whole-video-{index}.mp4"
+            command([
+                "ffmpeg", "-v", "error", "-nostdin", "-n",
+                "-threads", "1", "-filter_complex_threads", "1",
+                "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24:duration=34",
+                "-f", "lavfi", "-i", f"color=c={color}:s=160x90:r=24:d={duration - 34}",
+                "-f", "lavfi", "-i", f"sine=frequency={440 + 440 * index}:duration={duration}",
+                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                "-map", "[v]", "-map", "2:a", "-c:v", "libx265", "-preset", "ultrafast",
+                "-x265-params", "pools=none:frame-threads=1:keyint=48:scenecut=0:log-level=error",
+                "-c:a", "aac", "-t", str(duration), "-output_ts_offset", str(index * 10), str(path),
+            ])
+            inputs.append(path)
+        before = {path: (app.snapshot(path), digest(path)) for path in inputs}
+        cache_file = self.root / "whole-video.analysis.sqlite3"
+        short_plan = self.root / "whole-video-short.json"
+        short = self.cli([
+            "--dry-run", "--detection-length", "30", "--save-plan", str(short_plan),
+            "--analysis-cache", str(cache_file),
+        ], inputs, expected=3)
+        self.assertIsNone(short["intro"])
+        self.assertEqual(short["summary"]["would_cut"], 0)
+
+        full_plan = self.root / "whole-video-full.json"
+        full = self.cli([
+            "--dry-run", "-detection-length", "0", "--save-plan", str(full_plan),
+            "--analysis-cache", str(cache_file),
+        ], inputs)
+        self.assertAlmostEqual(full["intro"]["seconds"], 34, delta=0.125)
+        self.assertEqual(full["summary"]["would_cut"], 2)
+        self.assertEqual(json.loads(full_plan.read_text())["settings"]["scan_seconds"], 0)
+        with app.AnalysisCache(cache_file) as cache:
+            self.assertEqual(cache.connection.execute("SELECT count(*) FROM fingerprints").fetchone()[0], 4)
+            for index, (path, duration) in enumerate(zip(inputs, durations)):
+                movie = cache.load(path, 0, 8)
+                self.assertIsNotNone(movie)
+                self.assertEqual(len(movie.frames), duration * 8)
+                self.assertEqual(len(movie.audio), len(movie.frames))
+                self.assertAlmostEqual(movie.video_start, index * 10, delta=0.001)
+                self.assertEqual(len(cache.load(path, 30, 8).frames), 240)
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(app, "analyze", side_effect=AssertionError("analysis repeated")), redirect_stdout(
+            output
+        ), redirect_stderr(errors):
+            code = app.main([
+                "--dry-run", "--detection-length", "0", "--analysis-cache", str(cache_file),
+                "--json", *(str(path) for path in inputs),
+            ])
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assertEqual(json.loads(output.getvalue()), full)
+        replay = self.cli([
+            "--apply-plan", str(full_plan), "--detection-length", "0", "--dry-run",
+        ], inputs)
+        self.assertEqual(replay, full)
+        self.assertEqual(before, {path: (app.snapshot(path), digest(path)) for path in inputs})
+        self.assert_originals_unchanged()
+
+    def test_one_second_window_returns_and_replays_no_intro_without_extending(self):
+        plan_file = self.root / "one-second-plan.json"
+        inputs = self.matches[:3]
+        report = self.cli([
+            "--dry-run", "--detection-length", "1", "--save-plan", str(plan_file),
+        ], inputs, expected=3)
+        self.assertIsNone(report["intro"])
+        self.assertEqual(report["summary"]["would_cut"], 0)
+        with app.AnalysisCache(Path(str(plan_file) + ".analysis.sqlite3")) as cache:
+            for path in inputs:
+                self.assertEqual(len(cache.load(path, 1, 8).frames), 8)
+        replay = self.cli([
+            "--apply-plan", str(plan_file), "--detection-length", "1", "--dry-run",
+        ], inputs, expected=3)
+        self.assertEqual(replay, report)
+        self.assert_originals_unchanged()
+
     def test_corrupt_input_is_reported_and_still_counts_in_quorum(self):
         corrupt = self.root / "corrupt.mp4"
         corrupt.write_bytes(b"not a video")

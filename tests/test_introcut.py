@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 import io
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -195,6 +196,35 @@ class AudioDetectionTests(unittest.TestCase):
         self.assertFalse(app.similar_audio(original, sound(90), 0.1))
         self.assertFalse(app.similar_audio(original, solid(0), 0.1))
 
+    def test_temporal_variation_is_measured_within_each_recording_not_vote_winners(self):
+        def spectrum(angle):
+            angle = math.radians(angle)
+            values = [
+                round(120 + 60 * (
+                    math.cos(angle) * math.sin(2 * math.pi * index / app.PIXELS)
+                    + math.sin(angle) * math.cos(4 * math.pi * index / app.PIXELS)
+                ))
+                for index in range(app.PIXELS)
+            ]
+            return app.Frame.from_rgb(bytes(value for value in values for _ in range(3)))
+
+        center, left, right = (spectrum(angle) for angle in (0, -24, 24))
+        self.assertTrue(app.similar_audio(center, left, 0.1))
+        self.assertTrue(app.similar_audio(center, right, 0.1))
+        self.assertFalse(app.similar_audio(left, right, 0.1))
+        movies = [movie(0, [solid(0)] * 48, [center] * 24 + [sound(130)] * 24)]
+        for index in range(6):
+            prefix = [(left, right)[(step // 4 + index) % 2] for step in range(24)]
+            movies.append(movie(
+                index + 1, [solid(index * 25)] * 48, prefix + [sound(80 + index * 7)] * 24,
+            ))
+        result = app.detect(movies, 6, 8, 1, 0.1, audio=True)
+        self.assertEqual(result.seconds, 3)
+        self.assertEqual(result.members, tuple(range(1, 7)))
+        for index, item in enumerate(movies):
+            movies[index] = movie(index, list(item.frames), [item.audio[0]] * 24 + list(item.audio[24:]))
+        self.assertIsNone(app.detect(movies, 6, 8, 1, 0.1, audio=True).seconds)
+
     def test_silence_and_steady_tones_are_not_distinctive(self):
         for frame in (solid(0), solid(100), sound(15)):
             with self.subTest(frame=frame.mean):
@@ -378,6 +408,23 @@ class FileTests(unittest.TestCase):
         self.assertEqual(len(result.frames), 8)
         self.assertEqual(result.audio, ())
         self.assertEqual(tool.call_count, 1)
+
+    def test_full_video_analysis_uses_eof_without_requiring_duration_metadata(self):
+        metadata = {"streams": [
+            {"index": 0, "codec_type": "video", "start_time": "10.25"},
+            {"index": 1, "codec_type": "audio"},
+        ]}
+        audio = (sound(15),) * 40
+        with patch.object(app, "probe_json", return_value=metadata), patch.object(
+            app, "run_tool", return_value=texture().rgb * 40
+        ) as tool, patch.object(app, "audio_fingerprints", return_value=audio) as fingerprints:
+            result = app.analyze(self.source, 0, 8)
+        self.assertEqual(len(result.frames), 40)
+        self.assertEqual(result.audio, audio)
+        command = tool.call_args.args[0]
+        self.assertNotIn("-t", command)
+        self.assertNotIn("-frames:v", command)
+        fingerprints.assert_called_once_with(self.source, 1, 10.25, 5, 8)
 
     def test_audio_decode_error_is_not_silently_ignored(self):
         metadata = {"streams": [
@@ -683,6 +730,94 @@ class SavedPlanTests(unittest.TestCase):
                 copier.assert_not_called()
         self.assertFalse((self.root / "dry-output").exists())
 
+    def test_full_video_plan_round_trip_keeps_zero_setting(self):
+        code, original, errors = self.save(["--detection-length", "0"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(json.loads(self.plan.read_text())["settings"]["scan_seconds"], 0)
+        code, replay, errors = self.apply(["-detection-length", "0"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(json.loads(replay), json.loads(original))
+        self.assert_rejected_before_copy(["--detection-length", "6"], message="Cannot change")
+
+    def test_invalid_cache_has_a_cli_error_without_a_traceback_or_reanalysis(self):
+        cache = self.root / "invalid.analysis.sqlite3"
+        cache.write_bytes(b"not a database")
+        with patch.object(app, "analyze", side_effect=AssertionError("unexpected analysis")):
+            code, output, errors = self.invoke([
+                "--save-plan", str(self.plan), "--analysis-cache", str(cache),
+                *(str(path) for path in self.inputs),
+            ])
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("introcut:", errors)
+        self.assertNotIn("Traceback", errors)
+        self.assertFalse(self.plan.exists())
+        self.assertEqual(cache.read_bytes(), b"not a database")
+
+    def test_interrupted_planning_keeps_analysis_and_retry_skips_decoding(self):
+        code, _, errors = self.save(keys=KeyboardInterrupt())
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", errors)
+        self.assertFalse(self.plan.exists())
+        cache = Path(str(self.plan) + ".analysis.sqlite3")
+        self.assertTrue(cache.is_file())
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        code, output, errors = self.save(analyzer=lambda *_args: self.fail("decoding repeated"))
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(json.loads(output)["summary"]["would_cut"], 3)
+
+    def test_negative_plan_analysis_can_be_reused_for_a_new_plan(self):
+        code, _, errors = self.save(detection=app.Detection(reason="No intro"))
+        self.assertEqual((code, errors), (3, ""))
+        cache = Path(str(self.plan) + ".analysis.sqlite3")
+        original_plan = self.plan.read_bytes()
+        self.plan = self.root / "retry.json"
+        code, _, errors = self.save(
+            ["--analysis-cache", str(cache), "--threshold", "0.09"],
+            analyzer=lambda *_args: self.fail("decoding repeated"),
+        )
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual((self.root / "saved.json").read_bytes(), original_plan)
+
+    def test_cache_cannot_be_an_input_plan_or_video_destination(self):
+        alias = self.root / "cache-hardlink"
+        os.link(self.inputs[0], alias)
+        for target in (self.inputs[0], alias, self.plan):
+            with self.subTest(target=target.name):
+                code, _, errors = self.save(["--analysis-cache", str(target)])
+                self.assertEqual(code, 1)
+                self.assertIn("conflicts", errors)
+        self.assertFalse(self.plan.exists())
+        self.assertEqual(alias.read_bytes(), self.inputs[0].read_bytes())
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as result:
+            app.main(["--apply-plan", "plan.json", "--analysis-cache", "cache.sqlite3"])
+        self.assertEqual(result.exception.code, 2)
+
+    def test_detection_uses_exact_requested_window_without_implicit_staging(self):
+        unfinished = app.Detection(reason="opening continues")
+        cases = (
+            ([], 30, self.detection),
+            (["--detection-length", "0"], 0, unfinished),
+            (["--detection-length", "1"], 1, unfinished),
+            (["-detection-length", "6"], 6, self.detection),
+            (["--scan-seconds", "7200"], 7200, unfinished),
+        )
+        for options, seconds, detection in cases:
+            with self.subTest(seconds=seconds), patch.object(
+                app, "analyze", side_effect=self.analyze
+            ) as analyze, patch.object(
+                app, "detect", return_value=detection
+            ) as detect, patch.object(app, "find_keyframe", return_value=self.key):
+                code, _, errors = self.invoke([
+                    "--json", *options, *(str(path) for path in self.inputs),
+                ])
+                self.assertIn(code, (0, 3), errors)
+                self.assertEqual(
+                    [call.args[1] for call in analyze.call_args_list],
+                    [seconds] * len(self.inputs),
+                )
+                self.assertEqual(detect.call_count, 2)
+
     def test_output_mode_is_not_inherited_from_saved_dry_run(self):
         self.assertEqual(self.save(["--overwrite"])[0], 0)
         folder = self.root / "copies"
@@ -758,6 +893,7 @@ class SavedPlanTests(unittest.TestCase):
             ("--min-fraction", "0.8"), ("--sample-rate", "16"), ("--threshold", "0.2"),
             ("--scan-seconds", "60"), ("--min-intro", "2"), ("--keyframe-lookahead", "60"),
             ("--keyframe", "prev"), ("--thr", "0.2"),
+            ("--detection-length", "6"), ("-detection-length", "0"),
         ):
             with self.subTest(option=option):
                 self.assert_rejected_before_copy([option, value], message="Cannot change")
@@ -778,6 +914,25 @@ class SavedPlanTests(unittest.TestCase):
         self.assertEqual((code, errors), (3, ""))
         self.assertEqual(json.loads(output)["files"], json.loads(original)["files"])
         copier.assert_not_called()
+
+    def test_one_second_negative_plan_can_be_saved_and_replayed(self):
+        code, original, errors = self.save(
+            ["--detection-length", "1"], detection=app.Detection(reason="Scan too short"),
+        )
+        self.assertEqual((code, errors), (3, ""))
+        code, replay, errors = self.apply(["--detection-length", "1"])
+        self.assertEqual((code, errors), (3, ""))
+        self.assertEqual(json.loads(replay), json.loads(original))
+
+    def test_legacy_subsecond_plan_remains_replayable(self):
+        self.detection = app.Detection((0, 1, 2), 0.375, 0.25, 0.5, "found", ("video",))
+        self.assertEqual(self.save([
+            "--min-intro", "0.1", "--sample-rate", "16", "--detection-length", "1",
+        ])[0], 0)
+        saved = json.loads(self.plan.read_text())
+        saved["settings"]["scan_seconds"] = 0.5
+        self.plan.write_text(json.dumps(saved))
+        self.assertEqual(self.apply()[0], 0)
 
     def test_errors_and_no_keyframes_are_retained_without_retrying(self):
         def analyze(path, seconds, rate):
@@ -805,7 +960,8 @@ class SavedPlanTests(unittest.TestCase):
             (("format",), "other"), (("schema_version",), 2), (("schema_version",), True),
             (("settings", "sample_rate"), 0), (("settings", "sample_rate"), float("inf")),
             (("settings", "min_fraction"), True), (("settings", "keyframe"), "prev"),
-            (("settings", "scan_seconds"), 0.1), (("required_matches",), 2),
+            (("settings", "scan_seconds"), 0.1), (("settings", "scan_seconds"), -1),
+            (("settings", "scan_seconds"), float("inf")), (("required_matches",), 2),
             (("files",), []), (("files", 1), original["files"][0]),
             (("files", 0, "path"), "relative.mp4"), (("files", 0, "path"), "bad\0path"),
             (("files", 0, "snapshot"), [1, 2, 3]), (("files", 0, "snapshot"), [1, 2, True, 4]),
@@ -934,7 +1090,109 @@ class SavedPlanTests(unittest.TestCase):
         self.assertEqual(summary["cut_seconds_total"], 4)
 
 
+class AnalysisCacheTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="introcut-cache-unit-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "source.mp4"
+        self.source.write_bytes(b"original")
+        self.path = self.root / "analysis.sqlite3"
+        self.movie = app.Movie(
+            self.source, 0, 10, (texture(), texture(1)), app.snapshot(self.source),
+            (app.Chapter(0, 5, {"title": "chapter"}),), (2,), (sound(15), sound(30)),
+        )
+
+    def test_cache_round_trip_is_persistent_and_preserves_metadata(self):
+        with app.AnalysisCache(self.path) as cache:
+            self.assertIsNone(cache.load(self.source, 6, 8))
+            cache.store(self.movie, 6, 8)
+        with app.AnalysisCache(self.path) as cache:
+            self.assertEqual(cache.load(self.source, 6, 8), self.movie)
+            self.assertIsNone(cache.load(self.source, 30, 8))
+            self.assertIsNone(cache.load(self.source, 6, 16))
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list(self.root.glob("*-journal")), [])
+
+    def test_full_video_cache_has_no_zero_frame_limit(self):
+        with app.AnalysisCache(self.path) as cache:
+            cache.store(self.movie, 0, 8)
+            self.assertEqual(cache.load(self.source, 0, 8), self.movie)
+            self.assertIsNone(cache.load(self.source, 6, 8))
+
+    def test_full_video_cache_still_rejects_incomplete_frames(self):
+        with app.AnalysisCache(self.path) as cache:
+            cache.store(self.movie, 0, 8)
+            cache.connection.execute(
+                "UPDATE fingerprints SET frames=?", (app.zlib.compress(b"incomplete"),),
+            )
+            with self.assertRaisesRegex(app.IntrocutError, "dimensions"):
+                cache.load(self.source, 0, 8)
+
+    def test_changed_input_is_redecoded_and_cannot_be_checkpointed_as_old(self):
+        with app.AnalysisCache(self.path) as cache:
+            cache.store(self.movie, 6, 8)
+            self.source.write_bytes(b"modified original")
+            self.assertIsNone(cache.load(self.source, 6, 8))
+            with self.assertRaisesRegex(app.IntrocutError, "changed"):
+                cache.store(self.movie, 6, 8)
+
+    def test_corrupt_cache_is_reported_not_silently_used_or_redecoded(self):
+        with app.AnalysisCache(self.path) as cache:
+            cache.store(self.movie, 6, 8)
+            cache.connection.execute("UPDATE fingerprints SET frames=?", (b"corrupt",))
+            with self.assertRaisesRegex(app.IntrocutError, "Invalid analysis cache"):
+                cache.load(self.source, 6, 8)
+
+    def test_unrelated_files_and_symlinks_are_not_modified(self):
+        self.path.write_bytes(b"not a cache")
+        with self.assertRaises(app.sqlite3.Error):
+            app.AnalysisCache(self.path)
+        self.assertEqual(self.path.read_bytes(), b"not a cache")
+        alias = self.root / "link.sqlite3"
+        alias.symlink_to(self.path)
+        with self.assertRaisesRegex(app.IntrocutError, "symlink"):
+            app.AnalysisCache(alias)
+
+    def test_input_change_while_reading_cache_is_rejected(self):
+        with app.AnalysisCache(self.path) as cache:
+            cache.store(self.movie, 6, 8)
+            changed = (*self.movie.snapshot[:3], self.movie.snapshot[3] + 1)
+            with patch.object(app, "snapshot", side_effect=[self.movie.snapshot, changed]):
+                with self.assertRaisesRegex(app.IntrocutError, "changed"):
+                    cache.load(self.source, 6, 8)
+
+
 class CLITests(unittest.TestCase):
+    def test_detection_length_default_aliases_and_full_video(self):
+        parser = app.make_parser()
+        self.assertEqual(parser.parse_args([]).scan_seconds, 30)
+        for option in ("--detection-length", "-detection-length", "--scan-seconds"):
+            for value in ("0", "1", "1.5", "6", "7200"):
+                with self.subTest(option=option, value=value):
+                    args = parser.parse_args([option, value])
+                    app.validate_options(parser, args)
+                    self.assertEqual(args.scan_seconds, float(value))
+                    self.assertIn("scan_seconds", args.planning_options)
+        for value in ("-1", "0.5", "nan", "inf", "1e308"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(
+                SystemExit
+            ) as result:
+                args = parser.parse_args(["--detection-length", value])
+                app.validate_options(parser, args)
+            self.assertEqual(result.exception.code, 2)
+
+    def test_worker_default_and_limits_follow_cpu_count_with_fallback(self):
+        for cpus, limit, default in ((32, 32, 4), (8, 8, 4), (2, 2, 2), (1, 1, 1), (None, 16, 4)):
+            with self.subTest(cpus=cpus), patch.object(app.os, "cpu_count", return_value=cpus):
+                parser = app.make_parser()
+                self.assertEqual(parser.parse_args([]).workers, default)
+                for value in (1, limit):
+                    app.validate_options(parser, parser.parse_args(["--workers", str(value)]))
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as result:
+                    app.validate_options(parser, parser.parse_args(["--workers", str(limit + 1)]))
+                self.assertEqual(result.exception.code, 2)
+
     def test_next_keyframe_is_default_and_previous_spellings_are_compatible(self):
         parser = app.make_parser()
         self.assertEqual(parser.parse_args([]).keyframe, "next")
@@ -959,7 +1217,7 @@ class CLITests(unittest.TestCase):
         for arguments in (
             ["--threshold", "nan"], ["--sample-rate", "inf"],
             ["--min-fraction", "0.5"], ["--workers", "0"],
-            ["--scan-seconds", "1"], ["--null"],
+            ["--scan-seconds", "0.5"], ["--null"],
         ):
             with self.subTest(arguments=arguments):
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as result:

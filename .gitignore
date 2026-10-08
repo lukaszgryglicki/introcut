@@ -9,3 +9,4 @@ dist/
 *.secret
 /plan*.json
 /report*.json
+*.analysis.sqlite3*

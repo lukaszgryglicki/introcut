@@ -7,18 +7,23 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, replace
 import glob
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+from threading import Lock
 from typing import Sequence
+import zlib
 
 __version__ = "0.1.0"
 WIDTH, HEIGHT = 16, 9
@@ -29,11 +34,10 @@ PLANNING_BOUNDS = {
     "min_fraction": (0.5, 1),
     "sample_rate": (0, 60),
     "threshold": (0, 0.5),
-    "scan_seconds": (0, 3600),
     "min_intro": (0, 3600),
     "keyframe_lookahead": (0, 3600),
 }
-PLANNING_OPTIONS = (*PLANNING_BOUNDS, "keyframe")
+PLANNING_OPTIONS = (*PLANNING_BOUNDS, "scan_seconds", "keyframe")
 
 
 class IntrocutError(Exception):
@@ -245,13 +249,15 @@ def analyze(path: Path, scan_seconds: float, sample_rate: float) -> Movie:
         f"setpts=PTS-STARTPTS,fps=fps={sample_rate}:round=up,"
         f"scale={WIDTH}:{HEIGHT}:flags=area,format=rgb24"
     )
+    input_limit = ["-t", f"{scan_seconds:.9f}"] if scan_seconds else []
+    frame_limit = ["-frames:v", str(math.ceil(scan_seconds * sample_rate))] if scan_seconds else []
     raw = run_tool(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-threads", "1", "-filter_threads", "1",
-            "-t", f"{scan_seconds:.9f}", "-i", str(path),
+            *input_limit, "-i", str(path),
             "-map", f"0:{index}", "-an", "-sn", "-dn", "-vf", filters,
-            "-frames:v", str(math.ceil(scan_seconds * sample_rate)),
+            *frame_limit,
             "-threads:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
         ]
     )
@@ -269,11 +275,105 @@ def analyze(path: Path, scan_seconds: float, sample_rate: float) -> Movie:
     audio = ()
     if audio_stream is not None:
         audio = audio_fingerprints(
-            path, int(audio_stream["index"]), start, scan_seconds, sample_rate
+            path, int(audio_stream["index"]), start,
+            scan_seconds or len(frames) / sample_rate, sample_rate,
         )[:len(frames)]
     if snapshot(path) != before:
         raise IntrocutError("Input changed while it was being analyzed")
     return Movie(path, index, start, frames, before, chapters, chapter_streams, audio)
+
+
+class AnalysisCache:
+    """Checkpoint decoded fingerprints, never executable copy decisions."""
+
+    def __init__(self, path: Path):
+        path = path.expanduser().absolute()
+        if path.is_symlink():
+            raise IntrocutError("Analysis cache must not be a symlink")
+        created = False
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if not path.is_file():
+                raise IntrocutError("Analysis cache must be a regular file")
+        else:
+            os.close(descriptor)
+            created = True
+        self.lock = Lock()
+        self.connection = sqlite3.connect(
+            path.as_uri() + "?mode=rw", uri=True, check_same_thread=False, isolation_level=None,
+        )
+        try:
+            if created:
+                self.connection.execute(
+                    "CREATE TABLE fingerprints (key TEXT PRIMARY KEY, metadata TEXT NOT NULL, "
+                    "frames BLOB NOT NULL, audio BLOB NOT NULL) WITHOUT ROWID"
+                )
+                self.connection.execute("PRAGMA application_id=1229148756")
+                self.connection.execute("PRAGMA user_version=1")
+            if (
+                self.connection.execute("PRAGMA application_id").fetchone()[0] != 1229148756
+                or self.connection.execute("PRAGMA user_version").fetchone()[0] != 1
+            ):
+                raise IntrocutError("Unrecognized analysis cache; use a new cache filename")
+        except (sqlite3.Error, IntrocutError):
+            self.connection.close()
+            raise
+
+    def __enter__(self) -> AnalysisCache:
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.connection.close()
+
+    @staticmethod
+    def key(path: Path, state: tuple[int, int, int, int], seconds: float, rate: float) -> str:
+        settings = repr((state, float(seconds), float(rate))).encode()
+        return hashlib.sha256(os.fsencode(path) + b"\0" + settings).hexdigest()
+
+    def load(self, path: Path, seconds: float, rate: float) -> Movie | None:
+        state = snapshot(path)
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT metadata, frames, audio FROM fingerprints WHERE key=?",
+                (self.key(path, state, seconds, rate),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            movie = plan_movie(json.loads(row[0], object_pairs_hook=unique_plan_fields), path, state)
+            decoded = []
+            for data in row[1:]:
+                raw = zlib.decompress(data)
+                if len(raw) % FRAME_BYTES or (
+                    seconds > 0 and len(raw) > math.ceil(seconds * rate) * FRAME_BYTES
+                ):
+                    raise IntrocutError("Invalid cached fingerprint dimensions")
+                decoded.append(tuple(
+                    Frame.from_rgb(raw[offset:offset + FRAME_BYTES])
+                    for offset in range(0, len(raw), FRAME_BYTES)
+                ))
+            if not decoded[0] or len(decoded[1]) > len(decoded[0]):
+                raise IntrocutError("Invalid cached video/audio lengths")
+        except (ValueError, TypeError, zlib.error, IntrocutError) as exc:
+            raise IntrocutError(f"Invalid analysis cache entry: {exc}") from exc
+        if snapshot(path) != state:
+            raise IntrocutError("Input changed while loading cached analysis")
+        return replace(movie, frames=decoded[0], audio=decoded[1])
+
+    def store(self, movie: Movie, seconds: float, rate: float) -> None:
+        if snapshot(movie.path) != movie.snapshot:
+            raise IntrocutError("Input changed before analysis could be checkpointed")
+        with self.lock:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO fingerprints VALUES (?, ?, ?, ?)",
+                (
+                    self.key(movie.path, movie.snapshot, seconds, rate),
+                    json.dumps(movie_metadata(movie), allow_nan=False),
+                    zlib.compress(b"".join(frame.rgb for frame in movie.frames)),
+                    zlib.compress(b"".join(frame.rgb for frame in movie.audio)),
+                ),
+            )
 
 
 def similar(left: Frame, right: Frame, threshold: float) -> bool:
@@ -320,6 +420,18 @@ def majority_frame(
     return candidate
 
 
+def changing_audio(frames: Sequence[Frame], threshold: float) -> bool:
+    previous = None
+    changes = 0
+    for frame in frames:
+        if frame.variance >= 64 and (previous is None or not similar_audio(previous, frame, threshold)):
+            changes += previous is not None
+            previous = frame
+            if changes >= 2:
+                return True
+    return False
+
+
 def detect(
     movies: Sequence[Movie | None],
     required: int,
@@ -344,14 +456,17 @@ def detect(
     failed_count = 0
     informative = 0
     quiet_start = None
-    last_pattern = None
-    sound_changes = 0
 
     def finish(boundary: int) -> Detection:
         lower = max(0.0, (boundary - 1) / sample_rate)
         if lower < min_intro:
             return Detection(reason="No sufficiently long common opening found")
-        if informative < math.ceil(min_intro * sample_rate / 2) or (audio and sound_changes < 2):
+        # Vote winners can change recordings between timestamps; use each actual soundtrack.
+        members = tuple(sorted(
+            index for index, frames in active.items()
+            if not audio or changing_audio(frames[:boundary], threshold)
+        ))
+        if informative < math.ceil(min_intro * sample_rate / 2) or len(members) < required:
             return Detection(
                 reason=(
                     "Only silence, a steady tone, or insufficiently distinctive audio matched"
@@ -360,7 +475,7 @@ def detect(
                 )
             )
         return Detection(
-            members=tuple(sorted(active)),
+            members=members,
             seconds=boundary / sample_rate,
             boundary_min=lower,
             boundary_max=(boundary + 1) / sample_rate,
@@ -380,7 +495,7 @@ def detect(
                 return finish(quiet_start)
             return Detection(
                 reason="Common opening reaches the scan limit or a file's end; "
-                "increase --scan-seconds or provide more varied, longer videos"
+                "increase --detection-length or provide more varied, longer videos",
             )
         candidate = majority_frame(list(available.values()), threshold, audio=audio)
         matching = {
@@ -405,9 +520,6 @@ def detect(
             if candidate.variance >= 64:
                 informative += 1
                 quiet_start = None
-                if audio and (last_pattern is None or not compare(last_pattern, candidate, threshold)):
-                    sound_changes += last_pattern is not None
-                    last_pattern = candidate
             elif audio and quiet_start is None:
                 quiet_start = step
             continue
@@ -421,12 +533,14 @@ def detect(
         return finish(quiet_start)
     return Detection(
         reason="No ending observed before the scan limit or end of the videos; "
-        "increase --scan-seconds or provide more varied, longer videos"
+        "increase --detection-length or provide more varied, longer videos",
     )
 
 
 def combine_detections(video: Detection, audio: Detection, required: int) -> Detection:
     if audio.seconds is None:
+        if video.seconds is None:
+            return Detection(reason=f"Video: {video.reason}. Audio: {audio.reason}.")
         return video
     if video.seconds is None:
         return audio
@@ -649,6 +763,14 @@ def new_plan_path(path: Path) -> Path:
     return parent / path.name
 
 
+def movie_metadata(movie: Movie) -> dict:
+    return {
+        "video_index": movie.video_index, "video_start": movie.video_start,
+        "chapters": [asdict(chapter) for chapter in movie.chapters],
+        "chapter_streams": list(movie.chapter_streams),
+    }
+
+
 def save_plan(
     path: Path, plans: Sequence[FilePlan], movies: Sequence[Movie | None],
     keys: dict[int, Keyframe], detection: Detection, required: int,
@@ -662,11 +784,7 @@ def save_plan(
         media = None
         if index in keys:
             assert movie is not None
-            media = {
-                "video_index": movie.video_index, "video_start": movie.video_start,
-                "chapters": [asdict(chapter) for chapter in movie.chapters],
-                "chapter_streams": list(movie.chapter_streams),
-            }
+            media = movie_metadata(movie)
         entries.append({
             "path": plan.path, "snapshot": state, "status": plan.status, "reason": plan.reason,
             "movie": media, "keyframe": asdict(keys[index]) if index in keys else None,
@@ -772,12 +890,9 @@ def load_plan(
     for name, (lower, upper) in PLANNING_BOUNDS.items():
         settings[name] = plan_number(settings[name], name)
         check_plan(lower < settings[name] <= upper, f"{name} is out of range")
+    settings["scan_seconds"] = plan_number(settings["scan_seconds"], "scan_seconds")
+    check_plan(settings["scan_seconds"] >= 0, "scan_seconds is out of range")
     check_plan(settings["keyframe"] in ("previous", "next"), "keyframe policy")
-    check_plan(
-        settings["scan_seconds"]
-        >= settings["min_intro"] + (CONFIRM_FRAMES + 1) / settings["sample_rate"],
-        "scan is too short",
-    )
     for name in getattr(args, "planning_options", ()):
         if getattr(args, name) != settings[name]:
             raise IntrocutError(
@@ -791,7 +906,10 @@ def load_plan(
         and required == max(2, math.ceil(len(entries) * settings["min_fraction"] - 1e-12)),
         "required match count",
     )
-    found = plan_object(data["detection"], tuple(field.name for field in fields(Detection)), "detection")
+    found = plan_object(
+        data["detection"], ("members", "seconds", "boundary_min", "boundary_max", "reason", "evidence"),
+        "detection",
+    )
     members = plan_integers(found["members"], "detection members")
     check_plan(
         len(set(members)) == len(members) and all(0 <= index < len(entries) for index in members),
@@ -812,7 +930,8 @@ def load_plan(
         lower = plan_number(found["boundary_min"], "boundary minimum")
         upper = plan_number(found["boundary_max"], "boundary maximum")
         check_plan(
-            settings["min_intro"] <= lower <= seconds <= upper <= settings["scan_seconds"]
+            settings["min_intro"] <= lower <= seconds <= upper
+            and (settings["scan_seconds"] == 0 or upper <= settings["scan_seconds"])
             and seconds > 0 and len(members) >= required,
             "intro boundary/quorum",
         )
@@ -913,14 +1032,19 @@ def make_parser() -> argparse.ArgumentParser:
         "--apply-plan", type=Path, metavar="FILE",
         help="reuse a saved plan without detection; inputs must be unchanged",
     )
+    parser.add_argument(
+        "--analysis-cache", type=Path, metavar="FILE",
+        help="checkpoint analysis for retries; defaults to FILE.analysis.sqlite3 with --save-plan",
+    )
     parser.add_argument("--json", action="store_true", help="emit one machine-readable JSON report")
     parser.add_argument(
         "--min-fraction", type=float, action=PlanningOption, default=0.7,
         help="required majority (default: 0.7)",
     )
     parser.add_argument(
-        "--scan-seconds", type=float, action=PlanningOption, default=30,
-        help="opening scan limit (default: 30)",
+        "--detection-length", "-detection-length", "--scan-seconds", dest="scan_seconds",
+        type=float, action=PlanningOption, default=30, metavar="SECONDS",
+        help="seconds to analyze per video: >=1, or 0 for the full video (default: 30)",
     )
     parser.add_argument(
         "--sample-rate", type=float, action=PlanningOption, default=8,
@@ -934,7 +1058,12 @@ def make_parser() -> argparse.ArgumentParser:
         "--threshold", type=float, action=PlanningOption, default=0.10,
         help="picture/sound difference tolerance; lower is stricter (default: 0.10)",
     )
-    parser.add_argument("--workers", type=int, default=2, help="parallel analysis workers, 1-8 (default: 2)")
+    worker_limit = os.cpu_count() or 16
+    worker_default = min(4, worker_limit)
+    parser.add_argument(
+        "--workers", type=int, default=worker_default,
+        help=f"parallel per-file analysis workers, 1-{worker_limit} (default: {worker_default})",
+    )
     parser.add_argument(
         "--keyframe", choices=("next", "prev", "previous"), action=PlanningOption, default="next",
         type=lambda value: "previous" if value == "prev" else value,
@@ -952,13 +1081,13 @@ def validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         value = getattr(args, name)
         if not math.isfinite(value) or not lower < value <= upper:
             parser.error(f"--{name.replace('_', '-')} must be > {lower} and <= {upper}")
-    if (
-        args.apply_plan is None
-        and args.scan_seconds < args.min_intro + (CONFIRM_FRAMES + 1) / args.sample_rate
-    ):
-        parser.error("--scan-seconds must leave at least four samples after --min-intro")
-    if not 1 <= args.workers <= 8:
-        parser.error("--workers must be between 1 and 8")
+    if not math.isfinite(args.scan_seconds) or not (args.scan_seconds == 0 or args.scan_seconds >= 1):
+        parser.error("--detection-length must be 0 (full video) or at least 1 second")
+    if not math.isfinite(args.scan_seconds * args.sample_rate):
+        parser.error("--detection-length and --sample-rate produce an unrepresentable sample count")
+    worker_limit = os.cpu_count() or 16
+    if not 1 <= args.workers <= worker_limit:
+        parser.error(f"--workers must be between 1 and {worker_limit}")
     if args.null and args.files_from is None:
         parser.error("--null requires --files-from")
     if (
@@ -966,6 +1095,8 @@ def validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         and (args.overwrite or args.output_dir is not None)
     ):
         parser.error("--save-plan requires a dry run; add --dry-run")
+    if args.analysis_cache is not None and args.apply_plan is not None:
+        parser.error("--analysis-cache is for detection, not --apply-plan")
 
 
 def summarize(plans: Sequence[FilePlan], dry_run: bool) -> RunSummary:
@@ -1088,27 +1219,64 @@ def execute(args: argparse.Namespace) -> int:
             print(f"Using saved plan for {len(inputs)} videos; detection skipped.", file=sys.stderr)
     else:
         inputs = collect_inputs(args.videos, args.files_from, args.null)
+        output_paths = {
+            args.output_dir.resolve() / path.name for path in inputs
+        } if args.output_dir is not None else set()
+        if save_target in output_paths:
+            raise IntrocutError("Plan path conflicts with a video output path")
         snapshots = [snapshot(path) for path in inputs] if save_target is not None else []
         required = max(2, math.ceil(len(inputs) * args.min_fraction - 1e-12))
         plans = [FilePlan(str(path)) for path in inputs]
         movies: list[Movie | None] = [None] * len(inputs)
-        if not args.json:
-            print(f"Analyzing {len(inputs)} videos; {required} must share the opening.", file=sys.stderr)
+        cache_path = args.analysis_cache
+        if cache_path is None and save_target is not None:
+            cache_path = Path(str(save_target) + ".analysis.sqlite3")
+        if cache_path is not None:
+            cache_path = cache_path.expanduser().absolute()
+            if cache_path.resolve() in {*inputs, *output_paths, save_target} or (
+                cache_path.is_file()
+                and snapshot(cache_path)[:2] in {snapshot(path)[:2] for path in inputs}
+            ):
+                raise IntrocutError("Analysis cache conflicts with an input or plan path")
+        with AnalysisCache(cache_path) if cache_path is not None else nullcontext() as cache:
+            if not args.json:
+                window = f"up to {args.scan_seconds:g}s" if args.scan_seconds else "full videos"
+                print(
+                    f"Analyzing {len(inputs)} videos; {required} must share the opening "
+                    f"(scan {window}).",
+                    file=sys.stderr,
+                )
 
-        def scan(path: Path) -> Movie | str:
+            def scan(path: Path) -> tuple[Movie | str, bool]:
+                if cache is not None:
+                    cached = cache.load(path, args.scan_seconds, args.sample_rate)
+                    if cached is not None:
+                        return cached, True
+                try:
+                    return analyze(path, args.scan_seconds, args.sample_rate), False
+                except (IntrocutError, OSError) as exc:
+                    return str(exc), False
+
+            cached_count = 0
+            pool = ThreadPoolExecutor(max_workers=args.workers)
             try:
-                return analyze(path, args.scan_seconds, args.sample_rate)
-            except (IntrocutError, OSError) as exc:
-                return str(exc)
-
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            for index, result in enumerate(pool.map(scan, inputs)):
-                if isinstance(result, Movie):
-                    movies[index] = result
-                else:
-                    plans[index].status, plans[index].reason = "error", result
-                if not args.json and ((index + 1) % 100 == 0 or index + 1 == len(inputs)):
-                    print(f"Analyzed {index + 1}/{len(inputs)} videos.", file=sys.stderr)
+                for index, (result, cached) in enumerate(pool.map(scan, inputs)):
+                    cached_count += cached
+                    if isinstance(result, Movie):
+                        movies[index] = result
+                        plans[index].status, plans[index].reason = "unmatched", ""
+                        if cache is not None and not cached:
+                            cache.store(result, args.scan_seconds, args.sample_rate)
+                    else:
+                        movies[index] = None
+                        plans[index].status, plans[index].reason = "error", result
+                    if not args.json and ((index + 1) % 100 == 0 or index + 1 == len(inputs)):
+                        print(
+                            f"Analyzed {index + 1}/{len(inputs)} videos; {cached_count} cached.",
+                            file=sys.stderr,
+                        )
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
         video_detection = detect(
             movies, required, args.sample_rate, args.min_intro, args.threshold
         )
@@ -1118,6 +1286,8 @@ def execute(args: argparse.Namespace) -> int:
         detection = combine_detections(video_detection, audio_detection, required)
         keys: dict[int, Keyframe] = {}
         members = set(detection.members)
+        if not args.json and members:
+            print(f"Planning keyframe cuts for {len(members)} matching videos.", file=sys.stderr)
         for index, plan in enumerate(plans):
             if plan.status == "error":
                 continue
@@ -1144,6 +1314,8 @@ def execute(args: argparse.Namespace) -> int:
                 set_cut_details(plan, movie, key, detection)
             except (IntrocutError, OSError) as exc:
                 plan.status, plan.reason = "error", str(exc)
+        if not args.json and members:
+            print(f"Planned {len(keys)} usable cuts.", file=sys.stderr)
     if args.output_dir is not None:
         folder = args.output_dir.resolve()
         preflight_outputs(plans, inputs, folder)
@@ -1190,7 +1362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate_options(parser, args)
     try:
         return execute(args)
-    except (IntrocutError, OSError) as exc:
+    except (IntrocutError, OSError, sqlite3.Error) as exc:
         print(f"introcut: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
