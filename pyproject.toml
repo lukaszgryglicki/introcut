@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "introcut"
+version = "0.1.0"
+description = "Detect shared video intros and remove them with lossless keyframe cuts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "introcut contributors"}]
+keywords = ["ffmpeg", "video", "intro", "hevc", "stream-copy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.scripts]
+introcut = "introcut:main"
+
+[project.urls]
+Homepage = "https://github.com/lukaszgryglicki/introcut"
+Issues = "https://github.com/lukaszgryglicki/introcut/issues"
+
+[tool.setuptools]
+py-modules = ["introcut"]
