@@ -730,6 +730,75 @@ class SavedPlanTests(unittest.TestCase):
                 copier.assert_not_called()
         self.assertFalse((self.root / "dry-output").exists())
 
+    def test_text_copy_progress_is_flushed_after_each_attempt(self):
+        self.assertEqual(self.save()[0], 0)
+        cases = (
+            (["--overwrite"], None, 0, ("CUT", "CUT", "CUT")),
+            (["--output-dir", str(self.root / "copies")], None, 0, ("CUT", "CUT", "CUT")),
+            (["--overwrite"], app.IntrocutError("copy failed"), 1, ("CUT", "ERROR", "CUT")),
+            (["--overwrite"], KeyboardInterrupt(), 130, ("CUT", "INTERRUPTED")),
+        )
+        for options, failure, expected_code, statuses in cases:
+            with self.subTest(options=options, statuses=statuses):
+                attempted = 0
+
+                def progress_calls():
+                    return [
+                        call for call in printer.call_args_list
+                        if call.args and str(call.args[0]).startswith("Progress: ")
+                    ]
+
+                def copy(*_args, **_kwargs):
+                    nonlocal attempted
+                    self.assertEqual(len(progress_calls()), attempted)
+                    attempted += 1
+                    if attempted == 2 and failure is not None:
+                        raise failure
+
+                with patch("builtins.print", wraps=print) as printer, patch.object(
+                    app, "copy_movie", side_effect=copy
+                ), patch.object(app, "analyze", side_effect=AssertionError("analysis repeated")):
+                    code, output, errors = self.invoke([
+                        "--apply-plan", str(self.plan), *options,
+                    ])
+                self.assertEqual(code, expected_code, errors)
+                self.assertEqual(attempted, len(statuses))
+                updates = progress_calls()
+                self.assertEqual(len(updates), len(statuses))
+                for number, (call, status) in enumerate(zip(updates, statuses), 1):
+                    self.assertEqual(call.kwargs, {"flush": True})
+                    self.assertTrue(call.args[0].startswith(
+                        f"Progress: {number}/3 {status} {str(self.inputs[number - 1])!r}: "
+                    ))
+                    if status == "CUT":
+                        self.assertTrue(call.args[0].endswith("cut 4.000s"))
+                    elif status == "ERROR":
+                        self.assertIn("copy failed", call.args[0])
+                    else:
+                        self.assertIn("inspect this file", call.args[0])
+                self.assertNotIn("Progress:", errors)
+                self.assertLess(output.index(updates[-1].args[0]), output.index("\nSummary:"))
+                self.assertIn(f"{statuses.count('CUT')} cut;", output)
+
+    def test_json_copy_keeps_stdout_free_of_progress(self):
+        self.assertEqual(self.save()[0], 0)
+        with patch.object(app, "copy_movie"):
+            code, output, errors = self.apply(["--overwrite"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(json.loads(output)["summary"]["cut"], 3)
+        self.assertNotIn("Progress:", output)
+
+    def test_text_dry_run_does_not_emit_copy_progress(self):
+        self.assertEqual(self.save()[0], 0)
+        with patch.object(app, "copy_movie") as copier:
+            code, output, errors = self.invoke([
+                "--apply-plan", str(self.plan), "--overwrite", "--dry-run",
+            ])
+        self.assertEqual(code, 0, errors)
+        copier.assert_not_called()
+        self.assertNotIn("Progress:", output)
+        self.assertIn("3 would cut; 0 cut;", output)
+
     def test_full_video_plan_round_trip_keeps_zero_setting(self):
         code, original, errors = self.save(["--detection-length", "0"])
         self.assertEqual((code, errors), (0, ""))

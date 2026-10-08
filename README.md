@@ -255,16 +255,24 @@ Unmatched files are untouched. Per-file errors are reported and other eligible
 files can still finish; inspect the exit status and report before treating a
 batch as successful.
 
-Text reports list every input and finish with a summary of the intro, policy,
-file/status counts, total/range of video cuts, and estimated remaining intro and
-extra content removed. Cut statistics describe planned cuts in dry-run mode and
+During copying, text mode writes an immediately flushed progress update to
+**stdout** after every file attempt, including when stdout is redirected:
+`Progress: 1/10 CUT '/videos/clip.mp4': cut 3.125s`.
+The counter covers attempted copies; `ERROR` and `INTERRUPTED` updates include
+the reason instead of claiming a successful cut. Long copies can still be quiet
+between updates. Dry runs do not emit copy progress.
+
+The final text report still lists every input and finishes with a summary of the
+intro, policy, file/status counts, total/range of video cuts, and estimated
+remaining intro and extra content removed. Cut statistics describe planned cuts in dry-run mode and
 only completed cuts otherwise; failed, interrupted, and pending copies are not
 counted as completed work.
 
 `--json` emits a single report with `schema_version`, `dry_run`, `overwrite`,
 `intro` (or `null`), `required_matches`, `files`, and a structured `summary`.
-No prose is appended to JSON. Summary cut min/max values are `null` when there
-are no applicable cuts. In apply mode, `summary.pending` counts unprocessed
+Copy progress is suppressed in JSON mode; no prose is appended to JSON.
+Summary cut min/max values are `null` when there are no applicable cuts.
+In apply mode, `summary.pending` counts unprocessed
 `would_cut` files after interruption.
 A detected `intro` includes its `evidence`. Each file has a
 `status`, `matched`, `cut_seconds`, estimated leftovers/over-cut, output path, and

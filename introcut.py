@@ -1332,7 +1332,7 @@ def execute(args: argparse.Namespace) -> int:
             print(f"Saved plan: {save_target}", file=sys.stderr)
     interrupted = False
     if not dry_run:
-        for index, key in keys.items():
+        for processed, (index, key) in enumerate(keys.items(), 1):
             plan, movie = plans[index], movies[index]
             assert movie is not None and plan.output is not None
             try:
@@ -1347,6 +1347,16 @@ def execute(args: argparse.Namespace) -> int:
                     if pending.status == "would_cut":
                         pending.reason = "Not processed after interruption"
                 interrupted = True
+            if not args.json:
+                detail = plan.reason
+                if plan.status == "cut":
+                    assert plan.cut_seconds is not None
+                    detail = f"cut {plan.cut_seconds:.3f}s"
+                print(
+                    f"Progress: {processed}/{len(keys)} {plan.status.upper()} {plan.path!r}: {detail}",
+                    flush=True,
+                )
+            if interrupted:
                 break
     report(plans, detection, required, args, dry_run)
     if interrupted:
