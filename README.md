@@ -11,7 +11,7 @@ Run directly from this directory (no installation needed):
 
 ```sh
 python3 introcut.py --dry-run '/videos/*.mp4'
-python3 introcut.py --dry-run --json --files-from videos.txt > plan.json
+python3 introcut.py --dry-run --json --files-from videos.txt > report.json
 python3 introcut.py --files-from videos.txt --output-dir /videos/trimmed
 ```
 
@@ -26,7 +26,8 @@ Or install with `python3 -m pip install .` and use `introcut` instead of
 `python3 introcut.py`. Without `--output-dir` or `--overwrite`, the default is a
 dry run. `--dry-run` always disables copying/replacement, even with either output
 mode. `-overwrite` is also accepted. `--overwrite` and `--output-dir` cannot be
-combined.
+combined. The default cut uses the **next keyframe**, which can remove following
+content; use `--keyframe prev` to favor preserving it instead.
 
 For very large batches, **quote the glob** so Python expands it, not the shell:
 
@@ -50,13 +51,70 @@ stdin). Use `--null` for filenames containing newlines. Duplicate paths, symlink
 and hard links to the same file count only once. Separate copies of the same
 video still count separately; use a diverse batch, not duplicates.
 
+## Reuse a dry-run plan
+
+Save the reviewed cuts once, then apply them without repeating video/audio
+analysis, intro detection, or keyframe searching:
+
+```sh
+time python3 introcut.py --dry-run '/videos/hevc_*' --save-plan plan.json
+time python3 introcut.py --overwrite '/videos/hevc_*' --apply-plan plan.json
+```
+
+The plan contains absolute input paths, file identities, selected keyframes,
+and the metadata needed for the existing stream-copy checks, not decoded
+pictures or audio. Applying checks **every input** for changes in device, inode,
+size, and nanosecond modification time before creating any outputs. The supplied
+glob/list must expand to the same input set; added, removed, replaced, or changed
+files require a new plan. Reordering the inputs is allowed. If no inputs are
+given, the plan's saved paths are used.
+
+Output mode is chosen when applying, never inherited from the plan:
+
+```sh
+python3 introcut.py --apply-plan plan.json --overwrite --dry-run
+python3 introcut.py --apply-plan plan.json --output-dir /videos/trimmed
+```
+
+Without an output mode, applying is still a dry run. `--dry-run` always prevents
+video writes. Saved detection/keyframe settings remain in force; explicit
+conflicting settings are rejected. Unmatched files and saved errors/no-keyframe
+outcomes are retained, not reanalyzed. The final reports and exit codes work as
+usual. Copying still verifies the first output video packet against the saved
+keyframe payload hash before publishing anything.
+
+`--save-plan` is dry-run-only, cannot be combined with `--apply-plan`, and refuses
+to overwrite an existing path. Use a fresh plan filename for another scan.
+Plans are written atomically beside their destination, not in `/tmp`; the parent
+directory must already exist. Store plans outside the input glob. A plan is
+**not a resume log**: successful in-place replacements make it stale, even though
+file timestamps are preserved, so it cannot accidentally trim those files twice.
+After a partial overwrite, inspect the results before making a new plan.
+
+Plans contain private file paths: keep them out of version control and apply
+only plans you created and trust; do not edit them. `--json` is a report format,
+not an executable plan; use `--save-plan` to create one. Both options can be used
+together.
+
 ## Detection
 
-By default, at least **90%** of inputs (rounded up, minimum two) must share a
-visual opening of at least one second. Only the first 30 seconds are analyzed,
-at 8 samples/second. Small color thumbnails and a luminance-structure comparison
-make matching independent of resolution and encoding settings. Audio is not
-used for recognition, so different audio tracks/settings do not interfere.
+By default, at least **70%** of inputs (rounded up, minimum two) must share a
+distinctive opening of at least one second. Nonmatching files are skipped.
+Only the first 30 seconds are analyzed, at 8 samples/second, using **both video
+and audio**. Picture matching uses small color thumbnails and luminance structure.
+Sound matching uses normalized log-frequency spectra of the first audio track,
+downmixed/resampled in memory, to tolerate different sample rates, channel
+counts, and volume levels. No Python audio/image packages are required.
+
+Each cue establishes its own majority and ending. When their boundary intervals
+overlap and the required majority belongs to both groups, their matching files
+are combined. This lets shared sound recognize portrait/landscape variants that
+picture matching alone misses. A reliable visual ending takes precedence when
+the cues disagree, so a longer shared background soundtrack does not extend it.
+If only one cue establishes an ending, that cue can be used alone; absent or
+different audio does not prevent a valid visual match. Reports identify the
+evidence used (`video`, `audio`, or both); a combined result does not mean every
+member matched both cues.
 
 The detector votes for a majority at each timestamp, retains a consistent group
 of matching files, tolerates isolated mismatches, and waits for three consecutive
@@ -73,57 +131,61 @@ python3 introcut.py --dry-run --sample-rate 16 --threshold 0.08 /videos/*.mp4
 
 `--threshold` defaults to `0.10`; lower values are stricter. `--sample-rate`
 controls temporal resolution (default 0.125s steps). Reports include an estimated
-ending and a conservative interval extending one step either side.
+ending and a conservative interval extending one step either side of each
+supporting estimate.
 `--min-intro` sets the minimum duration; `--workers` limits analysis concurrency.
 Memory grows with the number of files and sampled seconds, not full video length.
 
-Different letterboxing or differently sized copies of the same logo can need a
-higher tolerance. For a large batch with a few-second intro, this is a useful
-**dry-run** starting point:
+For a large batch with a few-second intro, a shorter scan reduces decoding and
+memory use:
 
 ```sh
-python3 introcut.py --dry-run --scan-seconds 8 --threshold 0.25 '/videos/hevc_*'
+python3 introcut.py --dry-run --scan-seconds 8 '/videos/hevc_*'
 ```
 
-The shorter scan reduces decoding and memory use; it must still include the
-intro's ending and some following content. Raising the tolerance increases false
-match risk, so review the reported cohort/boundary and preview representative
-results before applying cuts. The default stays conservative.
+The scan must still include the intro's ending and some following content.
+Raising `--threshold` increases false-match risk; prefer the defaults and review
+the reported cohort/boundary before applying cuts.
 
-This is **visual similarity, not semantic recognition**. Starts must be aligned;
+This is **picture/sound similarity, not semantic recognition**. Starts must be aligned;
 different edits, playback speeds, crops, substantial overlays, or long fades can
 need manual review or fail to match. A shared scene following the intro is
-indistinguishable from part of the intro. Blank/solid-only openings are rejected
-as insufficient evidence. No cut is proposed if a reliable ending is not observed
+indistinguishable from part of the intro, and shared music alone is not proof of
+identical pictures. Blank/solid-only pictures, silence, and steady tones are
+insufficient evidence. Internal quiet gaps are allowed; trailing shared silence
+does not extend an audio intro. No cut is proposed if a reliable ending is not observed
 before the scan limit or end of the videos. Increase the scan limit in that case.
 Always inspect a dry run before processing valuable files.
 
 ## Lossless cuts and their limits
 
-The default `--keyframe previous` chooses the last usable keyframe **before the
-lower end of the detected boundary interval**. It favors preserving following
-content but can leave part of the intro. If only the initial keyframe qualifies,
-the file is reported as `no_keyframe` and is not copied.
+The default `--keyframe next` chooses the first usable keyframe **after the
+upper end of the detected boundary interval** to remove the entire estimated
+intro. This can also remove following content, especially with long GOPs.
+Next-keyframe searching is bounded by `--keyframe-lookahead` (default 30 seconds
+beyond the boundary).
 
-To remove the entire estimated intro, explicitly choose the first keyframe after
-the upper end of the interval:
+To favor preserving following content, explicitly choose `--keyframe prev`
+(`--keyframe previous` remains an equivalent spelling):
 
 ```sh
-python3 introcut.py --keyframe next --dry-run /videos/*.mp4
-python3 introcut.py --keyframe next --output-dir /videos/trimmed /videos/*.mp4
+python3 introcut.py --keyframe prev --dry-run '/videos/*.mp4'
+python3 introcut.py --keyframe prev --output-dir /videos/trimmed '/videos/*.mp4'
 ```
 
-This can also remove following content, especially with long GOPs. Both modes
-report the actual planned **video** cut timestamp, estimated remaining intro,
-and estimated extra content removed for every match. Next-keyframe searching is
-bounded by `--keyframe-lookahead` (default 30 seconds beyond the boundary).
+This chooses the last usable keyframe **before the lower end of the interval**
+and can leave part of the intro. If only the initial keyframe qualifies, the file
+is reported as `no_keyframe` and is not copied. Both modes report the actual
+planned **video** cut timestamp, estimated remaining intro, and estimated extra
+content removed for every match.
 
-All streams use `-c copy`: no video/audio re-encoding, resizing, frame-rate
+All output streams use `-c copy`: no video/audio re-encoding, resizing, frame-rate
 conversion, or resampling. Metadata is retained; chapters are shifted/clipped to
 the new timeline, and MP4 chapter carrier tracks are regenerated rather than
 duplicated.
-Only analysis thumbnails are decoded/resized. The new container's headers and
-timestamps necessarily differ from the original file. AAC packet boundaries
+Only in-memory analysis decodes/resizes pictures and resamples sound.
+The new container's headers and timestamps necessarily differ from the original
+file. AAC packet boundaries
 rarely coincide with video keyframes; a short amount of audio/reordering preroll
 can remain to preserve synchronization. The reported video cut is **not** a
 promise of sample-exact audio removal or an exact container-duration difference.
@@ -159,8 +221,18 @@ Unmatched files are untouched. Per-file errors are reported and other eligible
 files can still finish; inspect the exit status and report before treating a
 batch as successful.
 
-Text reports list every input. `--json` emits a single report with `schema_version`,
-`dry_run`, `overwrite`, `intro` (or `null`), `required_matches`, and `files`; each file has a
+Text reports list every input and finish with a summary of the intro, policy,
+file/status counts, total/range of video cuts, and estimated remaining intro and
+extra content removed. Cut statistics describe planned cuts in dry-run mode and
+only completed cuts otherwise; failed, interrupted, and pending copies are not
+counted as completed work.
+
+`--json` emits a single report with `schema_version`, `dry_run`, `overwrite`,
+`intro` (or `null`), `required_matches`, `files`, and a structured `summary`.
+No prose is appended to JSON. Summary cut min/max values are `null` when there
+are no applicable cuts. In apply mode, `summary.pending` counts unprocessed
+`would_cut` files after interruption.
+A detected `intro` includes its `evidence`. Each file has a
 `status`, `matched`, `cut_seconds`, estimated leftovers/over-cut, output path, and
 reason. Statuses are `unmatched`, `no_keyframe`, `would_cut`, `cut`, `error`, or
 `interrupted`; after interruption, remaining `would_cut` entries were not processed.
@@ -177,6 +249,8 @@ python3 -m unittest discover -s tests -v
 Tests include generated HEVC/AAC media and require FFmpeg with `libx265` and AAC
 encoders. They exercise majority/outlier detection, varied encoding settings,
 dry-run side effects, real packet-preserving cuts, and timestamp/keyframe traps.
+Saved-plan tests cover separate-process replay, unchanged-input preflight,
+malformed plans, and real stream copies with analysis/keyframe search disabled.
 
 ## License
 
